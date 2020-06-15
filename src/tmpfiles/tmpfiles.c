@@ -32,6 +32,8 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "glob-util.h"
+#include "hostname-util.h"
+#include "id128-util.h"
 #include "io-util.h"
 #include "label.h"
 #include "log.h"
@@ -40,6 +42,7 @@
 #include "mkdir.h"
 #include "mountpoint-util.h"
 #include "offline-passwd.h"
+#include "os-util.h"
 #include "pager.h"
 #include "parse-util.h"
 #include "path-lookup.h"
@@ -178,20 +181,21 @@ STATIC_DESTRUCTOR_REGISTER(arg_include_prefixes, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_exclude_prefixes, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 
+static int specifier_host_name_isol(char specifier, const void *data, const void *userdata, char **ret);
 static int specifier_machine_id_safe(char specifier, const void *data, const void *userdata, char **ret);
+static int specifier_boot_id_isol(char specifier, const void *data, const void *userdata, char **ret);
+static int specifier_os_field_isol(char specifier, const void *data, const void *userdata, char **ret);
 static int specifier_directory(char specifier, const void *data, const void *userdata, char **ret);
 
 static const Specifier specifier_table[] = {
         { 'm', specifier_machine_id_safe, NULL },
-        { 'b', specifier_boot_id,         NULL },
-        { 'H', specifier_host_name,       NULL },
-        { 'l', specifier_short_host_name, NULL },
-        { 'v', specifier_kernel_release,  NULL },
-        { 'a', specifier_architecture,    NULL },
-        { 'o', specifier_os_id,           NULL },
-        { 'w', specifier_os_version_id,   NULL },
-        { 'B', specifier_os_build_id,     NULL },
-        { 'W', specifier_os_variant_id,   NULL },
+        { 'b', specifier_boot_id_isol,    NULL },
+        { 'H', specifier_host_name_isol,  NULL },
+        { 'l', specifier_host_name_isol,  NULL },
+        { 'o', specifier_os_field_isol,   NULL },
+        { 'w', specifier_os_field_isol,   NULL },
+        { 'B', specifier_os_field_isol,   NULL },
+        { 'W', specifier_os_field_isol,   NULL },
 
         { 'g', specifier_group_name,      NULL },
         { 'G', specifier_group_id,        NULL },
@@ -208,18 +212,132 @@ static const Specifier specifier_table[] = {
         {}
 };
 
+static int id128_read_isol(const char *prefix, const char *p, Id128Format f, sd_id128_t *ret) {
+        _cleanup_free_ char *fullpath = NULL;
+
+        fullpath = path_join(arg_root, p);
+        if (!fullpath)
+                return -ENOMEM;
+        return id128_read(fullpath, f, ret);
+}
+
+static int specifier_machine_id_isol(
+        const char *prefix, char specifier, const void *data, const void *userdata, char **ret) {
+        int r;
+        char *n;
+        sd_id128_t machine_id = {};
+
+        r = id128_read_isol(prefix, "/etc/machine-id", ID128_PLAIN, &machine_id);
+        if (r < 0)
+                return r;
+        if (sd_id128_is_null(machine_id))
+                return -ENOMEDIUM;
+
+        n = new (char, 33);
+        if (!n)
+                return -ENOMEM;
+
+        *ret = sd_id128_to_string(machine_id, n);
+        return r;
+}
+
+static int read_etc_hostname_isol(const char *prefix, bool shorten, char **ret) {
+        int r;
+        _cleanup_free_ char *fullpath = NULL;
+
+        fullpath = path_join(prefix, "/etc/hostname");
+        if (!fullpath)
+                return -ENOMEM;
+        r = read_etc_hostname(fullpath, ret);
+        if (r < 0)
+                return r;
+        if (shorten) {
+                char *idn = strchr(*ret, '.');
+                if (idn)
+                        *idn = '\0';
+        }
+        return r;
+}
+
+static int specifier_host_name_isol(char specifier, const void *data, const void *userdata, char **ret) {
+        char *n;
+
+        if (!empty_or_root(arg_root))
+                return read_etc_hostname_isol(arg_root, specifier == 'l', ret);
+        n = specifier == 'l' ? gethostname_short_malloc() : gethostname_malloc();
+        if (!n)
+                return -ENOMEM;
+        *ret = n;
+        return 0;
+}
+
 static int specifier_machine_id_safe(char specifier, const void *data, const void *userdata, char **ret) {
         int r;
+
+        if (!empty_or_root(arg_root))
+                r = specifier_machine_id_isol(arg_root, specifier, data, userdata, ret);
+        else
+                r = specifier_machine_id(specifier, data, userdata, ret);
 
         /* If /etc/machine_id is missing or empty (e.g. in a chroot environment)
          * return a recognizable error so that the caller can skip the rule
          * gracefully. */
-
-        r = specifier_machine_id(specifier, data, userdata, ret);
         if (IN_SET(r, -ENOENT, -ENOMEDIUM))
                 return -ENXIO;
 
         return r;
+}
+
+static int specifier_boot_id_isol(char specifier, const void *data, const void *userdata, char **ret) {
+        int r;
+
+        if (!empty_or_root(arg_root))
+                return -ENXIO;
+        r = specifier_boot_id(specifier, data, userdata, ret);
+        if (IN_SET(r, -ENOENT, -ENOMEDIUM))
+                return -ENXIO;
+        return r;
+}
+
+
+static int specifier_os_release_common_isol(const char *field, char **ret) {
+        char *t = NULL;
+        int r;
+
+        r = parse_os_release(!empty_or_root(arg_root) ? arg_root : NULL, field, &t, NULL);
+        if (r < 0)
+                return r;
+        if (!t) {
+                /* fields in /etc/os-release might quite possibly be missing, even if everything is entirely
+                 * valid otherwise. Let's hence return "" in that case. */
+                t = strdup("");
+                if (!t)
+                        return -ENOMEM;
+        }
+
+        *ret = t;
+        return 0;
+}
+
+static int specifier_os_field_isol(char specifier, const void *data, const void *userdata, char **ret) {
+        const char *field = NULL;
+        switch (specifier) {
+        case 'o':
+                field = "ID";
+                break;
+        case 'w':
+                field = "VERSION_ID";
+                break;
+        case 'B':
+                field = "BUILD_ID";
+                break;
+        case 'W':
+                field = "VARIANT_ID";
+                break;
+        default:
+                assert_not_reached("Bad state");
+        }
+        return specifier_os_release_common_isol(field, ret);
 }
 
 static int specifier_directory(char specifier, const void *data, const void *userdata, char **ret) {
